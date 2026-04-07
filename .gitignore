@@ -1,0 +1,7 @@
+.env
+__pycache__/
+*.pyc
+data/faiss_index/
+data/docstore.pkl
+data/table_summaries_checkpoint.json
+data/eval_results.jsonl
