@@ -5,3 +5,6 @@ data/faiss_index/
 data/docstore.pkl
 data/table_summaries_checkpoint.json
 data/eval_results.jsonl
+sdd.md
+report.md
+presentation_outline.md
