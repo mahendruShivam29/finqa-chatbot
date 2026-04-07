@@ -1,23 +1,57 @@
 import json
+import pickle
 import time
+import uuid
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
-from langchain_core.documents import Document
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+import faiss
 import tiktoken
+from langchain.retrievers import MultiVectorRetriever
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.storage import InMemoryStore
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
+from langchain_core.language_models import BaseChatModel
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_community.docstore.in_memory import InMemoryDocstore
+from langchain_community.vectorstores import FAISS
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from rank_bm25 import BM25Okapi
 
 
 DATA_DIR = Path("data")
 FAISS_INDEX_DIR = DATA_DIR / "faiss_index"
+FAISS_INDEX_FILE = FAISS_INDEX_DIR / "index.faiss"
+DOCSTORE_FILE = DATA_DIR / "docstore.pkl"
 TABLE_SUMMARIES_CHECKPOINT = DATA_DIR / "table_summaries_checkpoint.json"
 DATASET_FILES = ("train.json", "dev.json", "test.json")
 ENCODING = tiktoken.get_encoding("cl100k_base")
+RRF_K = 60
+
+
+@dataclass
+class HybridRetriever:
+    bm25: BM25Okapi
+    bm25_docs: list[Document]
+    multi_vector_retriever: MultiVectorRetriever
+    parent_lookup: dict[str, Document]
+
+    def invoke(self, query: str, k: int = 3) -> list[Document]:
+        return hybrid_retrieve(
+            query=query,
+            k=k,
+            bm25=self.bm25,
+            bm25_docs=self.bm25_docs,
+            multi_vector_retriever=self.multi_vector_retriever,
+            parent_lookup=self.parent_lookup,
+        )
 
 
 def ensure_data_directories() -> None:
-    """Create the local data and source directory structure required by the SDD."""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    FAISS_INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_json_file(path: str | Path) -> list[dict[str, Any]]:
@@ -26,7 +60,6 @@ def load_json_file(path: str | Path) -> list[dict[str, Any]]:
 
 
 def load_all_samples(data_dir: str | Path = DATA_DIR) -> list[dict[str, Any]]:
-    """Load train/dev/test FinQA samples from disk using Python's json library."""
     data_dir = Path(data_dir)
     samples: list[dict[str, Any]] = []
     for filename in DATASET_FILES:
@@ -89,15 +122,12 @@ def _paragraph_documents(paragraphs: list[str], sample_id: str) -> list[Document
 
 
 def preprocess_sample(sample: dict[str, Any]) -> list[Document]:
-    """Apply the SDD chunking rules: paragraph-level text chunks and one intact table."""
     sample_id = str(sample["id"])
     paragraphs = [*sample.get("pre_text", []), *sample.get("post_text", [])]
-
     documents = _paragraph_documents(paragraphs, sample_id)
-    table_markdown = table_to_markdown(sample.get("table", []))
     documents.append(
         Document(
-            page_content=table_markdown,
+            page_content=table_to_markdown(sample.get("table", [])),
             metadata={"type": "table", "source": sample_id, "chunk_index": 0},
         )
     )
@@ -105,7 +135,8 @@ def preprocess_sample(sample: dict[str, Any]) -> list[Document]:
 
 
 def should_skip_ingestion(index_dir: str | Path = FAISS_INDEX_DIR) -> bool:
-    return Path(index_dir).exists()
+    index_dir = Path(index_dir)
+    return index_dir.exists() and FAISS_INDEX_FILE.exists() and DOCSTORE_FILE.exists()
 
 
 def load_table_summary_checkpoint(
@@ -114,7 +145,6 @@ def load_table_summary_checkpoint(
     checkpoint_path = Path(checkpoint_path)
     if not checkpoint_path.exists():
         return {}
-
     with open(checkpoint_path, "r", encoding="utf-8") as f:
         return json.load(f)
 
@@ -137,21 +167,15 @@ def print_table_summarization_estimate(table_count: int) -> None:
 
 def summarize_table_with_retry(
     markdown_table: str,
-    summarizer,
+    summarizer: Callable[[str], str],
     max_retries: int = 3,
     initial_backoff_s: int = 2,
 ) -> str:
-    """
-    Summarize a table with retry/backoff.
-
-    The actual summarizer implementation is wired in Step 2 when the retrieval
-    stack is built. This helper enforces the Step 1 batching/retry contract.
-    """
     last_error: Exception | None = None
     for attempt in range(max_retries):
         try:
             return summarizer(markdown_table)
-        except Exception as exc:  # pragma: no cover - network/API failures are runtime concerns
+        except Exception as exc:  # pragma: no cover - runtime API failures
             last_error = exc
             if attempt == max_retries - 1:
                 break
@@ -161,14 +185,14 @@ def summarize_table_with_retry(
 
 def checkpoint_table_summaries(
     table_documents: list[Document],
-    summarizer,
+    summarizer: Callable[[str], str],
     checkpoint_every: int = 100,
     checkpoint_path: str | Path = TABLE_SUMMARIES_CHECKPOINT,
 ) -> dict[str, str]:
-    """Resumeable table summarization for the global index ingestion flow."""
     summaries = load_table_summary_checkpoint(checkpoint_path)
+    completed = len(summaries)
 
-    for idx, document in enumerate(table_documents, start=1):
+    for document in table_documents:
         source = str(document.metadata.get("source", ""))
         chunk_index = int(document.metadata.get("chunk_index", 0))
         key = f"{source}:table:{chunk_index}"
@@ -176,21 +200,343 @@ def checkpoint_table_summaries(
             continue
 
         summaries[key] = summarize_table_with_retry(document.page_content, summarizer)
-        if idx % checkpoint_every == 0:
+        completed += 1
+        if completed % checkpoint_every == 0:
             save_table_summary_checkpoint(summaries, checkpoint_path)
 
     save_table_summary_checkpoint(summaries, checkpoint_path)
     return summaries
 
 
-def load_or_build_index():
-    """
-    Step 1 persistence gate.
+def get_embedding_model() -> Embeddings:
+    return OpenAIEmbeddings(model="text-embedding-3-small")
 
-    If the persisted FAISS index already exists, later steps will load it from
-    disk. Otherwise, later steps will run the full ingestion pipeline.
-    """
+
+def get_table_summarizer() -> BaseChatModel:
+    return ChatOpenAI(model="gpt-4o-mini")
+
+
+def _default_table_summary(markdown_table: str, llm: BaseChatModel | None = None) -> str:
+    llm = llm or get_table_summarizer()
+    response = llm.invoke(
+        [
+            SystemMessage(
+                content=(
+                    "Summarize the following financial table in plain English, "
+                    "highlighting key numerical values and their meaning."
+                )
+            ),
+            HumanMessage(content=markdown_table),
+        ]
+    )
+    return response.content if isinstance(response.content, str) else str(response.content)
+
+
+def _document_key(document: Document) -> tuple[str, str, int]:
+    return (
+        str(document.metadata.get("source", "")),
+        str(document.metadata.get("type", "")),
+        int(document.metadata.get("chunk_index", 0)),
+    )
+
+
+def _tokenize_for_bm25(text: str) -> list[str]:
+    return text.lower().split()
+
+
+def _build_vectorstore(child_documents: list[Document], embeddings: Embeddings) -> FAISS:
+    if not child_documents:
+        raise ValueError("Cannot build a vector store with no child documents.")
+    return FAISS.from_documents(child_documents, embeddings)
+
+
+def build_hybrid_retriever(
+    documents: list[Document],
+    *,
+    embeddings: Embeddings | None = None,
+    table_summaries: dict[str, str] | None = None,
+    use_table_summaries: bool = True,
+) -> HybridRetriever:
+    embeddings = embeddings or get_embedding_model()
+    parent_store = InMemoryStore()
+    child_documents: list[Document] = []
+    bm25_documents: list[Document] = []
+    parent_lookup: dict[str, Document] = {}
+
+    for document in documents:
+        metadata = dict(document.metadata)
+        parent_id = str(uuid.uuid4())
+        parent_document = Document(page_content=document.page_content, metadata=metadata)
+        parent_lookup[parent_id] = parent_document
+        parent_store.mset([(parent_id, parent_document)])
+
+        if metadata["type"] == "table":
+            summary_key = f"{metadata['source']}:table:{metadata['chunk_index']}"
+            summary_text = (
+                table_summaries.get(summary_key, document.page_content)
+                if table_summaries
+                else document.page_content
+            )
+            if not use_table_summaries:
+                summary_text = document.page_content
+
+            child_documents.append(
+                Document(
+                    page_content=summary_text,
+                    metadata={
+                        "type": "table_summary" if use_table_summaries else "table",
+                        "source": metadata["source"],
+                        "chunk_index": metadata["chunk_index"],
+                        "doc_id": parent_id,
+                    },
+                )
+            )
+            bm25_documents.append(
+                Document(
+                    page_content=summary_text,
+                    metadata={
+                        "type": "table_summary",
+                        "source": metadata["source"],
+                        "chunk_index": metadata["chunk_index"],
+                        "parent_id": parent_id,
+                    },
+                )
+            )
+            bm25_documents.append(
+                Document(
+                    page_content=document.page_content,
+                    metadata={
+                        "type": "table_raw_bm25",
+                        "source": metadata["source"],
+                        "chunk_index": metadata["chunk_index"],
+                        "parent_id": parent_id,
+                    },
+                )
+            )
+            continue
+
+        child_documents.append(
+            Document(
+                page_content=document.page_content,
+                metadata={
+                    "type": metadata["type"],
+                    "source": metadata["source"],
+                    "chunk_index": metadata["chunk_index"],
+                    "doc_id": parent_id,
+                },
+            )
+        )
+        bm25_documents.append(parent_document)
+
+    vectorstore = _build_vectorstore(child_documents, embeddings)
+    multi_vector_retriever = MultiVectorRetriever(
+        vectorstore=vectorstore,
+        docstore=parent_store,
+        id_key="doc_id",
+    )
+    bm25_corpus = [_tokenize_for_bm25(doc.page_content) for doc in bm25_documents]
+    bm25 = BM25Okapi(bm25_corpus if bm25_corpus else [["placeholder"]])
+
+    return HybridRetriever(
+        bm25=bm25,
+        bm25_docs=bm25_documents if bm25_documents else [],
+        multi_vector_retriever=multi_vector_retriever,
+        parent_lookup=parent_lookup,
+    )
+
+
+def _resolve_bm25_hits(
+    ranked_hits: list[tuple[int, Document]],
+    parent_lookup: dict[str, Document],
+) -> list[Document]:
+    best_by_key: dict[tuple[str, str, int], tuple[int, Document]] = {}
+
+    for rank, document in ranked_hits:
+        doc_type = str(document.metadata.get("type", ""))
+        if doc_type in {"table_summary", "table_raw_bm25"}:
+            parent_id = str(document.metadata["parent_id"])
+            resolved = parent_lookup[parent_id]
+        else:
+            resolved = document
+
+        key = _document_key(resolved)
+        current = best_by_key.get(key)
+        if current is None or rank < current[0]:
+            best_by_key[key] = (rank, resolved)
+
+    return [item[1] for item in sorted(best_by_key.values(), key=lambda x: x[0])]
+
+
+def hybrid_retrieve(
+    query: str,
+    *,
+    k: int = 3,
+    bm25: BM25Okapi,
+    bm25_docs: list[Document],
+    multi_vector_retriever: MultiVectorRetriever,
+    parent_lookup: dict[str, Document],
+) -> list[Document]:
+    bm25_ranked_hits: list[tuple[int, Document]] = []
+    if bm25_docs:
+        scores = bm25.get_scores(_tokenize_for_bm25(query))
+        sorted_indices = sorted(
+            range(len(bm25_docs)),
+            key=lambda idx: scores[idx],
+            reverse=True,
+        )
+        top_indices = sorted_indices[: max(k * 3, k)]
+        bm25_ranked_hits = [
+            (rank, bm25_docs[idx]) for rank, idx in enumerate(top_indices, start=1)
+        ]
+
+    bm25_resolved = _resolve_bm25_hits(bm25_ranked_hits, parent_lookup)
+    faiss_results = multi_vector_retriever.invoke(query)
+
+    scores_by_key: dict[tuple[str, str, int], float] = {}
+    docs_by_key: dict[tuple[str, str, int], Document] = {}
+
+    for rank, document in enumerate(bm25_resolved, start=1):
+        key = _document_key(document)
+        scores_by_key[key] = scores_by_key.get(key, 0.0) + 0.4 * (1 / (rank + RRF_K))
+        docs_by_key[key] = document
+
+    for rank, document in enumerate(faiss_results, start=1):
+        key = _document_key(document)
+        scores_by_key[key] = scores_by_key.get(key, 0.0) + 0.6 * (1 / (rank + RRF_K))
+        docs_by_key[key] = document
+
+    ranked = sorted(scores_by_key.items(), key=lambda item: item[1], reverse=True)
+    return [docs_by_key[key] for key, _ in ranked[:k]]
+
+
+def _serialize_parent_store(parent_store: InMemoryStore) -> dict[str, Any]:
+    return dict(parent_store.store)
+
+
+def _load_parent_store(records: dict[str, Any]) -> InMemoryStore:
+    parent_store = InMemoryStore()
+    parent_store.store = dict(records)
+    return parent_store
+
+
+def save_hybrid_retriever(
+    retriever: HybridRetriever,
+    index_dir: str | Path = FAISS_INDEX_DIR,
+    docstore_path: str | Path = DOCSTORE_FILE,
+) -> None:
+    index_dir = Path(index_dir)
+    index_dir.mkdir(parents=True, exist_ok=True)
+    faiss.write_index(retriever.multi_vector_retriever.vectorstore.index, str(FAISS_INDEX_FILE))
+
+    payload = {
+        "bm25_docs": retriever.bm25_docs,
+        "parent_lookup": retriever.parent_lookup,
+        "vectorstore_docstore": dict(
+            retriever.multi_vector_retriever.vectorstore.docstore._dict
+        ),
+        "index_to_docstore_id": dict(
+            retriever.multi_vector_retriever.vectorstore.index_to_docstore_id
+        ),
+        "parent_store": _serialize_parent_store(retriever.multi_vector_retriever.docstore),
+    }
+    with open(docstore_path, "wb") as f:
+        pickle.dump(payload, f)
+
+
+def load_hybrid_retriever(
+    embeddings: Embeddings | None = None,
+    index_dir: str | Path = FAISS_INDEX_DIR,
+    docstore_path: str | Path = DOCSTORE_FILE,
+) -> HybridRetriever:
+    embeddings = embeddings or get_embedding_model()
+    index = faiss.read_index(str(FAISS_INDEX_FILE))
+
+    with open(docstore_path, "rb") as f:
+        payload = pickle.load(f)
+
+    vectorstore = FAISS(
+        embedding_function=embeddings,
+        index=index,
+        docstore=InMemoryDocstore(payload["vectorstore_docstore"]),
+        index_to_docstore_id=payload["index_to_docstore_id"],
+    )
+    parent_store = _load_parent_store(payload["parent_store"])
+    multi_vector_retriever = MultiVectorRetriever(
+        vectorstore=vectorstore,
+        docstore=parent_store,
+        id_key="doc_id",
+    )
+    bm25_docs: list[Document] = payload["bm25_docs"]
+    bm25_tokens = [_tokenize_for_bm25(doc.page_content) for doc in bm25_docs]
+    bm25 = BM25Okapi(bm25_tokens if bm25_tokens else [["placeholder"]])
+
+    return HybridRetriever(
+        bm25=bm25,
+        bm25_docs=bm25_docs,
+        multi_vector_retriever=multi_vector_retriever,
+        parent_lookup=payload["parent_lookup"],
+    )
+
+
+def build_global_hybrid_retriever(
+    *,
+    data_dir: str | Path = DATA_DIR,
+    embeddings: Embeddings | None = None,
+    summarizer_llm: BaseChatModel | None = None,
+) -> HybridRetriever:
+    ensure_data_directories()
+    samples = load_all_samples(data_dir)
+    documents = [doc for sample in samples for doc in preprocess_sample(sample)]
+    table_documents = [doc for doc in documents if doc.metadata["type"] == "table"]
+
+    print_table_summarization_estimate(len(table_documents))
+    proceed = input().strip().lower()
+    if proceed not in {"", "y", "yes", "n", "no"}:
+        proceed = "y"
+    if proceed in {"n", "no"}:
+        raise RuntimeError("Ingestion cancelled by user.")
+
+    summarizer_llm = summarizer_llm or get_table_summarizer()
+    summaries = checkpoint_table_summaries(
+        table_documents,
+        summarizer=lambda markdown: _default_table_summary(markdown, summarizer_llm),
+    )
+    retriever = build_hybrid_retriever(
+        documents,
+        embeddings=embeddings,
+        table_summaries=summaries,
+        use_table_summaries=True,
+    )
+    save_hybrid_retriever(retriever)
+    return retriever
+
+
+def build_eval_sample_retriever(
+    sample: dict[str, Any],
+    embeddings: Embeddings | None = None,
+) -> HybridRetriever:
+    documents = preprocess_sample(sample)
+    return build_hybrid_retriever(
+        documents,
+        embeddings=embeddings,
+        use_table_summaries=False,
+    )
+
+
+def build_pooled_eval_retriever(
+    samples: list[dict[str, Any]],
+    embeddings: Embeddings | None = None,
+) -> HybridRetriever:
+    documents = [doc for sample in samples for doc in preprocess_sample(sample)]
+    return build_hybrid_retriever(
+        documents,
+        embeddings=embeddings,
+        use_table_summaries=False,
+    )
+
+
+def load_or_build_index() -> HybridRetriever:
     ensure_data_directories()
     if should_skip_ingestion():
-        return None
-    return None
+        return load_hybrid_retriever()
+    return build_global_hybrid_retriever()
