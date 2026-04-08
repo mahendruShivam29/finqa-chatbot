@@ -1,13 +1,14 @@
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 
+load_dotenv()
+
 from graph import build_graph
 from ingest import load_or_build_index
 from tools import configure_retriever_tool
 
 
 def main() -> None:
-    load_dotenv()
     retriever = load_or_build_index()
     configure_retriever_tool(retriever)
     compiled_graph = build_graph()

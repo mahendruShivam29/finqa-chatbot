@@ -1,9 +1,9 @@
 from typing import Any
 
-from langchain.tools.retriever import create_retriever_tool
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
-from langchain_experimental.tools import PythonREPLTool
+from langchain_core.tools.retriever import create_retriever_tool
+from langchain_experimental.tools import PythonAstREPLTool
 from pydantic import PrivateAttr
 
 
@@ -31,10 +31,10 @@ financial_document_retriever = create_retriever_tool(
     ),
 )
 
-# PRODUCTION NOTE: In a production environment, replace PythonREPLTool with
+# PRODUCTION NOTE: In a production environment, replace the local Python REPL
 # a sandboxed execution environment such as E2B (e2b_code_interpreter) or a
 # Dockerized container to prevent Arbitrary Code Execution (ACE) vulnerabilities.
-python_repl = PythonREPLTool()
+python_repl = PythonAstREPLTool()
 python_repl.description = (
     "Use this tool to execute Python code for mathematical calculations. "
     "Pass the exact Python code to run as a string. "

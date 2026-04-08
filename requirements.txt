@@ -2,6 +2,7 @@ langchain
 langchain-openai
 langchain-community
 langchain-experimental
+langchain-text-splitters
 langgraph
 langsmith
 openai

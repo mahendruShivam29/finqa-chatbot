@@ -176,6 +176,3 @@ def build_graph(scoped_retriever=None):
     )
     builder.add_edge("generate_final_answer", END)
     return builder.compile()
-
-
-compiled_graph = build_graph()

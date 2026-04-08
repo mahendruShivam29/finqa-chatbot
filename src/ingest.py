@@ -3,21 +3,22 @@ import pickle
 import time
 import uuid
 from dataclasses import dataclass
+from datetime import timedelta
 from pathlib import Path
 from typing import Any, Callable
 
 import faiss
 import tiktoken
-from langchain.retrievers import MultiVectorRetriever
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.storage import InMemoryStore
+from langchain_classic.retrievers import MultiVectorRetriever
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.stores import InMemoryStore
 from langchain_community.docstore.in_memory import InMemoryDocstore
 from langchain_community.vectorstores import FAISS
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 from rank_bm25 import BM25Okapi
 
 
@@ -29,6 +30,11 @@ TABLE_SUMMARIES_CHECKPOINT = DATA_DIR / "table_summaries_checkpoint.json"
 DATASET_FILES = ("train.json", "dev.json", "test.json")
 ENCODING = tiktoken.get_encoding("cl100k_base")
 RRF_K = 60
+TABLE_SUMMARY_REQUEST_TIMEOUT_S = 60
+TABLE_SUMMARY_MAX_RETRIES = 3
+TABLE_SUMMARY_INITIAL_BACKOFF_S = 2
+TABLE_SUMMARY_CHECKPOINT_EVERY = 10
+TABLE_SUMMARY_PROGRESS_EVERY = 5
 
 
 @dataclass
@@ -165,32 +171,59 @@ def print_table_summarization_estimate(table_count: int) -> None:
     print("Proceed? [Y/n]")
 
 
+def _format_duration(seconds: float) -> str:
+    return str(timedelta(seconds=max(int(seconds), 0)))
+
+
 def summarize_table_with_retry(
     markdown_table: str,
     summarizer: Callable[[str], str],
-    max_retries: int = 3,
-    initial_backoff_s: int = 2,
+    table_key: str,
+    max_retries: int = TABLE_SUMMARY_MAX_RETRIES,
+    initial_backoff_s: int = TABLE_SUMMARY_INITIAL_BACKOFF_S,
 ) -> str:
     last_error: Exception | None = None
-    for attempt in range(max_retries):
+    for attempt in range(1, max_retries + 1):
         try:
             return summarizer(markdown_table)
         except Exception as exc:  # pragma: no cover - runtime API failures
             last_error = exc
-            if attempt == max_retries - 1:
+            print(
+                f"[table-summary] {table_key} failed on attempt {attempt}/{max_retries}: {exc}",
+                flush=True,
+            )
+            if attempt == max_retries:
                 break
-            time.sleep(initial_backoff_s * (2**attempt))
+            backoff = initial_backoff_s * (2 ** (attempt - 1))
+            print(f"[table-summary] retrying {table_key} in {backoff}s", flush=True)
+            time.sleep(backoff)
     raise RuntimeError("Table summarization failed after retries") from last_error
 
 
 def checkpoint_table_summaries(
     table_documents: list[Document],
     summarizer: Callable[[str], str],
-    checkpoint_every: int = 100,
+    checkpoint_every: int = TABLE_SUMMARY_CHECKPOINT_EVERY,
     checkpoint_path: str | Path = TABLE_SUMMARIES_CHECKPOINT,
 ) -> dict[str, str]:
     summaries = load_table_summary_checkpoint(checkpoint_path)
     completed = len(summaries)
+    already_completed = completed
+    total = len(table_documents)
+    pending = total - completed
+    start_time = time.time()
+
+    if completed:
+        print(
+            f"[table-summary] resuming from checkpoint: {completed:,}/{total:,} completed, "
+            f"{pending:,} remaining",
+            flush=True,
+        )
+    else:
+        print(
+            f"[table-summary] starting new run: {total:,} tables to summarize",
+            flush=True,
+        )
 
     for document in table_documents:
         source = str(document.metadata.get("source", ""))
@@ -199,12 +232,41 @@ def checkpoint_table_summaries(
         if key in summaries:
             continue
 
-        summaries[key] = summarize_table_with_retry(document.page_content, summarizer)
+        item_start = time.time()
+        print(
+            f"[table-summary] processing {completed + 1:,}/{total:,} -> {key}",
+            flush=True,
+        )
+        summaries[key] = summarize_table_with_retry(
+            document.page_content,
+            summarizer,
+            table_key=key,
+        )
         completed += 1
+        item_duration = time.time() - item_start
+
+        if completed % TABLE_SUMMARY_PROGRESS_EVERY == 0 or completed == total:
+            elapsed = time.time() - start_time
+            finished_this_run = max(completed - already_completed, 1)
+            rate = finished_this_run / elapsed if elapsed > 0 else 0.0
+            remaining = total - completed
+            eta_seconds = remaining / rate if rate > 0 else 0.0
+            print(
+                f"[table-summary] progress {completed:,}/{total:,} "
+                f"({completed / total:.1%}) | last={item_duration:.1f}s | "
+                f"rate={rate:.2f} tables/s | eta={_format_duration(eta_seconds)}",
+                flush=True,
+            )
+
         if completed % checkpoint_every == 0:
             save_table_summary_checkpoint(summaries, checkpoint_path)
+            print(
+                f"[table-summary] checkpoint saved at {completed:,}/{total:,}",
+                flush=True,
+            )
 
     save_table_summary_checkpoint(summaries, checkpoint_path)
+    print(f"[table-summary] checkpoint saved at {completed:,}/{total:,}", flush=True)
     return summaries
 
 
@@ -213,7 +275,11 @@ def get_embedding_model() -> Embeddings:
 
 
 def get_table_summarizer() -> BaseChatModel:
-    return ChatOpenAI(model="gpt-4o-mini")
+    return ChatOpenAI(
+        model="gpt-4o-mini",
+        timeout=TABLE_SUMMARY_REQUEST_TIMEOUT_S,
+        max_retries=0,
+    )
 
 
 def _default_table_summary(markdown_table: str, llm: BaseChatModel | None = None) -> str:

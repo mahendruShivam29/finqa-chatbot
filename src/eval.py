@@ -4,6 +4,7 @@ import re
 import time
 from statistics import mean
 
+from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
@@ -15,6 +16,8 @@ from ingest import (
     get_embedding_model,
     load_json_file,
 )
+
+load_dotenv()
 
 
 def parse_args() -> argparse.Namespace:
