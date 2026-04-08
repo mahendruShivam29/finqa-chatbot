@@ -1,6 +1,7 @@
 import re
 from typing import Annotated
 
+from config import ensure_env_loaded
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, START, StateGraph
@@ -28,6 +29,7 @@ def _extract_code(text: str) -> str:
 
 
 def build_graph(scoped_retriever=None):
+    ensure_env_loaded()
     llm = ChatOpenAI(model="gpt-4o-mini")
 
     def retrieve(state: AgentState) -> dict:
@@ -40,7 +42,7 @@ def build_graph(scoped_retriever=None):
         if scoped_retriever is not None:
             documents = scoped_retriever.invoke(question, k=3)
         else:
-            documents = retrieve_documents(question, k=3)
+            documents = retrieve_documents(question, k=6)
 
         if not documents:
             return {"retrieved_context": "NO RELEVANT DOCUMENTS FOUND."}
@@ -74,7 +76,13 @@ def build_graph(scoped_retriever=None):
                     content=(
                         "You are a financial analyst assistant. Given financial context "
                         "and a question, write a Python script that calculates the exact "
-                        "numerical answer. Always end your script with a print() statement "
+                        "numerical answer. Use only values explicitly present in the "
+                        "retrieved context or in the user's question. The retrieved "
+                        "context may include Markdown tables; extract and use numerical "
+                        "values directly from those tables when relevant. Never assume, "
+                        "invent, estimate, or use placeholder/example values. If the "
+                        "required values are not present, return code that prints exactly "
+                        "'UNABLE_TO_ANSWER'. Always end your script with a print() statement "
                         "showing the result. Return ONLY the Python code, no explanation."
                     )
                 ),
@@ -87,6 +95,24 @@ def build_graph(scoped_retriever=None):
             return {
                 "generated_code": "",
                 "execution_result": "ERROR: LLM returned empty code block. No code to execute.",
+                "error_count": state["error_count"] + 1,
+            }
+
+        lowered_code = code.lower()
+        banned_markers = (
+            "example",
+            "placeholder",
+            "assume",
+            "dummy",
+            "sample value",
+        )
+        if any(marker in lowered_code for marker in banned_markers):
+            return {
+                "generated_code": "",
+                "execution_result": (
+                    "ERROR: LLM generated code with assumed or placeholder values. "
+                    "Use only values found in the retrieved context."
+                ),
                 "error_count": state["error_count"] + 1,
             }
 
@@ -117,6 +143,15 @@ def build_graph(scoped_retriever=None):
                 )
             }
 
+        execution_result = str(state.get("execution_result", "")).strip()
+        if execution_result == "UNABLE_TO_ANSWER":
+            return {
+                "final_answer": (
+                    "I could not answer from the retrieved context because the "
+                    "required values were not found explicitly."
+                )
+            }
+
         question = state["messages"][0].content if state["messages"] else ""
         response = llm.invoke(
             [
@@ -125,7 +160,7 @@ def build_graph(scoped_retriever=None):
                         f"Given this question: {question}\n\n"
                         f"Retrieved context:\n{state.get('retrieved_context', '')}\n\n"
                         f"Generated code:\n{state.get('generated_code', '')}\n\n"
-                        f"Computation result: {state.get('execution_result', '')}\n\n"
+                        f"Computation result: {execution_result}\n\n"
                         "Write a clear, concise natural language answer. "
                         "State the numerical result explicitly."
                     )

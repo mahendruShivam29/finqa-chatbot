@@ -4,10 +4,10 @@ import re
 import time
 from statistics import mean
 
-from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 from langchain_openai import ChatOpenAI
 
+from config import ensure_env_loaded
 from graph import build_graph
 from ingest import (
     DATA_DIR,
@@ -17,7 +17,7 @@ from ingest import (
     load_json_file,
 )
 
-load_dotenv()
+ensure_env_loaded()
 
 
 def parse_args() -> argparse.Namespace:

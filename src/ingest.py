@@ -1,5 +1,6 @@
 import json
 import pickle
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -9,6 +10,7 @@ from typing import Any, Callable
 
 import faiss
 import tiktoken
+from config import ensure_env_loaded
 from langchain_classic.retrievers import MultiVectorRetriever
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -43,9 +45,10 @@ class HybridRetriever:
     bm25_docs: list[Document]
     multi_vector_retriever: MultiVectorRetriever
     parent_lookup: dict[str, Document]
+    source_table_lookup: dict[str, Document]
 
     def invoke(self, query: str, k: int = 3) -> list[Document]:
-        return hybrid_retrieve(
+        results = hybrid_retrieve(
             query=query,
             k=k,
             bm25=self.bm25,
@@ -53,6 +56,7 @@ class HybridRetriever:
             multi_vector_retriever=self.multi_vector_retriever,
             parent_lookup=self.parent_lookup,
         )
+        return _expand_with_same_source_tables(results, self.source_table_lookup, k)
 
 
 def ensure_data_directories() -> None:
@@ -271,10 +275,12 @@ def checkpoint_table_summaries(
 
 
 def get_embedding_model() -> Embeddings:
+    ensure_env_loaded()
     return OpenAIEmbeddings(model="text-embedding-3-small")
 
 
 def get_table_summarizer() -> BaseChatModel:
+    ensure_env_loaded()
     return ChatOpenAI(
         model="gpt-4o-mini",
         timeout=TABLE_SUMMARY_REQUEST_TIMEOUT_S,
@@ -306,8 +312,110 @@ def _document_key(document: Document) -> tuple[str, str, int]:
     )
 
 
+def _expand_with_same_source_tables(
+    results: list[Document],
+    source_table_lookup: dict[str, Document],
+    k: int,
+) -> list[Document]:
+    expanded: list[Document] = []
+    seen_keys: set[tuple[str, str, int]] = set()
+
+    for document in results:
+        key = _document_key(document)
+        if key not in seen_keys:
+            expanded.append(document)
+            seen_keys.add(key)
+
+        source = str(document.metadata.get("source", ""))
+        table_doc = source_table_lookup.get(source)
+        if table_doc is None:
+            continue
+        table_key = _document_key(table_doc)
+        if table_key not in seen_keys:
+            expanded.append(table_doc)
+            seen_keys.add(table_key)
+
+    return expanded[:k]
+
+
 def _tokenize_for_bm25(text: str) -> list[str]:
     return text.lower().split()
+
+
+def _content_keywords(text: str) -> list[str]:
+    normalized = re.sub(r"[^a-zA-Z0-9\s]", " ", text.lower())
+    stopwords = {
+        "a",
+        "an",
+        "and",
+        "are",
+        "as",
+        "at",
+        "be",
+        "by",
+        "for",
+        "from",
+        "help",
+        "in",
+        "is",
+        "of",
+        "on",
+        "or",
+        "the",
+        "to",
+        "use",
+        "using",
+        "value",
+        "values",
+        "was",
+        "what",
+        "which",
+        "with",
+    }
+    return [token for token in normalized.split() if token not in stopwords]
+
+
+def _generate_query_variants(query: str) -> list[str]:
+    variants: list[str] = []
+
+    def add(candidate: str) -> None:
+        normalized = " ".join(candidate.strip().split())
+        if normalized and normalized not in variants:
+            variants.append(normalized)
+
+    add(query)
+
+    stripped = query.strip()
+    if ":" in stripped:
+        add(stripped.split(":", 1)[0])
+
+    helper_markers = (
+        "help:",
+        "context:",
+        "hint:",
+        "use:",
+        "fetch values from:",
+    )
+    lowered = stripped.lower()
+    for marker in helper_markers:
+        idx = lowered.find(marker)
+        if idx != -1:
+            add(stripped[:idx])
+
+    keywords = _content_keywords(stripped)
+    if keywords:
+        add(" ".join(keywords))
+
+    return variants
+
+
+def _keyword_coverage_score(query: str, document: Document) -> float:
+    query_keywords = set(_content_keywords(query))
+    if not query_keywords:
+        return 0.0
+    document_keywords = set(_content_keywords(document.page_content))
+    overlap = len(query_keywords & document_keywords)
+    return overlap / len(query_keywords)
 
 
 def _build_vectorstore(child_documents: list[Document], embeddings: Embeddings) -> FAISS:
@@ -328,6 +436,7 @@ def build_hybrid_retriever(
     child_documents: list[Document] = []
     bm25_documents: list[Document] = []
     parent_lookup: dict[str, Document] = {}
+    source_table_lookup: dict[str, Document] = {}
 
     for document in documents:
         metadata = dict(document.metadata)
@@ -337,6 +446,7 @@ def build_hybrid_retriever(
         parent_store.mset([(parent_id, parent_document)])
 
         if metadata["type"] == "table":
+            source_table_lookup[str(metadata["source"])] = parent_document
             summary_key = f"{metadata['source']}:table:{metadata['chunk_index']}"
             summary_text = (
                 table_summaries.get(summary_key, document.page_content)
@@ -408,6 +518,7 @@ def build_hybrid_retriever(
         bm25_docs=bm25_documents if bm25_documents else [],
         multi_vector_retriever=multi_vector_retriever,
         parent_lookup=parent_lookup,
+        source_table_lookup=source_table_lookup,
     )
 
 
@@ -442,36 +553,54 @@ def hybrid_retrieve(
     multi_vector_retriever: MultiVectorRetriever,
     parent_lookup: dict[str, Document],
 ) -> list[Document]:
-    bm25_ranked_hits: list[tuple[int, Document]] = []
-    if bm25_docs:
-        scores = bm25.get_scores(_tokenize_for_bm25(query))
-        sorted_indices = sorted(
-            range(len(bm25_docs)),
-            key=lambda idx: scores[idx],
-            reverse=True,
-        )
-        top_indices = sorted_indices[: max(k * 3, k)]
-        bm25_ranked_hits = [
-            (rank, bm25_docs[idx]) for rank, idx in enumerate(top_indices, start=1)
-        ]
+    query_variants = _generate_query_variants(query)
+    bm25_scores_by_key: dict[tuple[str, str, int], float] = {}
+    docs_by_key: dict[tuple[str, str, int], Document] = {}
+    faiss_scores_by_key: dict[tuple[str, str, int], float] = {}
 
-    bm25_resolved = _resolve_bm25_hits(bm25_ranked_hits, parent_lookup)
-    faiss_results = multi_vector_retriever.invoke(query)
+    if bm25_docs:
+        for variant in query_variants:
+            scores = bm25.get_scores(_tokenize_for_bm25(variant))
+            sorted_indices = sorted(
+                range(len(bm25_docs)),
+                key=lambda idx: scores[idx],
+                reverse=True,
+            )
+            top_indices = sorted_indices[: max(k * 3, k)]
+            bm25_ranked_hits = [
+                (rank, bm25_docs[idx]) for rank, idx in enumerate(top_indices, start=1)
+            ]
+            bm25_resolved = _resolve_bm25_hits(bm25_ranked_hits, parent_lookup)
+            for rank, document in enumerate(bm25_resolved, start=1):
+                key = _document_key(document)
+                score = 0.4 * (1 / (rank + RRF_K))
+                if score > bm25_scores_by_key.get(key, 0.0):
+                    bm25_scores_by_key[key] = score
+                    docs_by_key[key] = document
+
+    for variant in query_variants:
+        faiss_results = multi_vector_retriever.invoke(variant)
+        for rank, document in enumerate(faiss_results, start=1):
+            key = _document_key(document)
+            score = 0.6 * (1 / (rank + RRF_K))
+            if score > faiss_scores_by_key.get(key, 0.0):
+                faiss_scores_by_key[key] = score
+                docs_by_key[key] = document
 
     scores_by_key: dict[tuple[str, str, int], float] = {}
-    docs_by_key: dict[tuple[str, str, int], Document] = {}
+    for key, score in bm25_scores_by_key.items():
+        scores_by_key[key] = scores_by_key.get(key, 0.0) + score
+    for key, score in faiss_scores_by_key.items():
+        scores_by_key[key] = scores_by_key.get(key, 0.0) + score
 
-    for rank, document in enumerate(bm25_resolved, start=1):
-        key = _document_key(document)
-        scores_by_key[key] = scores_by_key.get(key, 0.0) + 0.4 * (1 / (rank + RRF_K))
-        docs_by_key[key] = document
-
-    for rank, document in enumerate(faiss_results, start=1):
-        key = _document_key(document)
-        scores_by_key[key] = scores_by_key.get(key, 0.0) + 0.6 * (1 / (rank + RRF_K))
-        docs_by_key[key] = document
-
-    ranked = sorted(scores_by_key.items(), key=lambda item: item[1], reverse=True)
+    ranked = sorted(
+        scores_by_key.items(),
+        key=lambda item: (
+            item[1] + 0.2 * _keyword_coverage_score(query, docs_by_key[item[0]]),
+            _keyword_coverage_score(query, docs_by_key[item[0]]),
+        ),
+        reverse=True,
+    )
     return [docs_by_key[key] for key, _ in ranked[:k]]
 
 
@@ -483,6 +612,14 @@ def _load_parent_store(records: dict[str, Any]) -> InMemoryStore:
     parent_store = InMemoryStore()
     parent_store.store = dict(records)
     return parent_store
+
+
+def _build_source_table_lookup(parent_lookup: dict[str, Document]) -> dict[str, Document]:
+    lookup: dict[str, Document] = {}
+    for document in parent_lookup.values():
+        if str(document.metadata.get("type", "")) == "table":
+            lookup[str(document.metadata.get("source", ""))] = document
+    return lookup
 
 
 def save_hybrid_retriever(
@@ -497,6 +634,7 @@ def save_hybrid_retriever(
     payload = {
         "bm25_docs": retriever.bm25_docs,
         "parent_lookup": retriever.parent_lookup,
+        "source_table_lookup": retriever.source_table_lookup,
         "vectorstore_docstore": dict(
             retriever.multi_vector_retriever.vectorstore.docstore._dict
         ),
@@ -541,6 +679,10 @@ def load_hybrid_retriever(
         bm25_docs=bm25_docs,
         multi_vector_retriever=multi_vector_retriever,
         parent_lookup=payload["parent_lookup"],
+        source_table_lookup=payload.get(
+            "source_table_lookup",
+            _build_source_table_lookup(payload["parent_lookup"]),
+        ),
     )
 
 

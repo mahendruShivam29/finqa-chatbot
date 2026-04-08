@@ -1,7 +1,8 @@
-from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
 
-load_dotenv()
+from config import ensure_env_loaded
+
+ensure_env_loaded()
 
 from graph import build_graph
 from ingest import load_or_build_index
