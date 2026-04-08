@@ -80,9 +80,15 @@ START --> retrieve --> reason_and_code --> execute
 
 ## Architecture Diagrams
 
+### Data Ingestion And Persistence
+
 ![Data Ingestion And Persistence](data_ingestion_and_persistence.png)
 
+### Inference And Agentic Loop
+
 ![Inference And Agentic Loop](inference_and_agentic_loop.png)
+
+### Evaluation And Monitoring
 
 ![Evaluation And Monitoring](evaluation_and_monitoring.png)
 
